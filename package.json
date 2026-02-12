@@ -1,6 +1,6 @@
 {
   "name": "continuity-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "CONTINUITY - Session State Persistence for AI Systems. Crashes lose seconds, not hours.",
   "main": "dist/index.js",
   "type": "module",

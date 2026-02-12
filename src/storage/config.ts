@@ -15,6 +15,7 @@ const DEFAULTS: ContinuityConfig = {
   decisions_dir: join(DEFAULT_DATA_DIR, 'decisions'),
   db_path: join(DEFAULT_DATA_DIR, 'state.db'),
   auto_checkpoint_interval: 5,
+  auto_escalation_threshold: 15,
   compression_target_tokens: 1000,
   handoff_quality_threshold: 80,
 };

@@ -55,15 +55,17 @@ export const sessionTools: Tool[] = [
   },
   {
     name: 'continuity_checkpoint',
-    description: 'Save intermediate state during work. Call every 3-5 tool calls for crash protection. Lightweight — just updates the state DB.',
+    description: 'Save intermediate state during work. Call every 3-5 tool calls for crash protection. Accumulates session context across calls — each checkpoint carries full running state so it can serve as a handoff if the session ends unexpectedly. Auto-escalates to a full session save every 15 checkpoints (configurable).',
     inputSchema: {
       type: 'object' as const,
       properties: {
         workspace: { type: 'string', description: 'Project workspace identifier' },
         operation: { type: 'string', description: 'What was just completed' },
-        active_files: { type: 'array', items: { type: 'string' }, description: 'Files currently being worked on' },
-        next_steps: { type: 'array', items: { type: 'string' }, description: 'Immediate next steps' },
-        decisions: { type: 'array', items: { type: 'string' }, description: 'Key decisions made since last checkpoint' },
+        phase: { type: 'string', description: 'Current work phase (e.g., "implementation", "debugging"). Persists across checkpoints until changed.' },
+        active_files: { type: 'array', items: { type: 'string' }, description: 'Files currently being worked on (replaces previous list)' },
+        next_steps: { type: 'array', items: { type: 'string' }, description: 'Immediate next steps (replaces previous list)' },
+        decisions: { type: 'array', items: { type: 'string' }, description: 'Key decisions made since last checkpoint (appended, deduplicated)' },
+        warnings: { type: 'array', items: { type: 'string' }, description: 'Issues to flag (appended across checkpoints)' },
         trigger: { type: 'string', enum: ['manual', 'shim', 'kernl', 'gitflow', 'auto'], description: 'What triggered this checkpoint' },
       },
       required: ['workspace', 'operation'],
@@ -81,11 +83,85 @@ export const sessionTools: Tool[] = [
   },
 ];
 
+// ─── Session Accumulator ─────────────────────────────────────────
+// Tracks running state across checkpoints so any checkpoint
+// can serve as a full handoff if the session ends unexpectedly.
+
+interface AccumulatorState {
+  workspace: string;
+  phase: string;
+  completed_operations: Array<{ description: string; result: string }>;
+  active_files: string[];
+  decisions_made: string[];
+  next_steps: string[];
+  warnings: string[];
+  checkpoint_count: number;
+  last_escalation: string | null;
+}
+
 // ─── Handler Factory ─────────────────────────────────────────────
 
 export function createSessionHandlers(db: ContinuityDatabase, config: ContinuityConfig) {
   // Track current session
   let currentSessionId: string | null = null;
+
+  // Per-workspace accumulators: track running state across checkpoints
+  const accumulators = new Map<string, AccumulatorState>();
+
+  function getOrCreateAccumulator(workspace: string): AccumulatorState {
+    if (!accumulators.has(workspace)) {
+      accumulators.set(workspace, {
+        workspace,
+        phase: 'unknown',
+        completed_operations: [],
+        active_files: [],
+        decisions_made: [],
+        next_steps: [],
+        warnings: [],
+        checkpoint_count: 0,
+        last_escalation: null,
+      });
+    }
+    return accumulators.get(workspace)!;
+  }
+
+  function escalateToFullSave(acc: AccumulatorState): {
+    handoff_path: string;
+    json_path: string;
+  } {
+    const now = new Date().toISOString();
+    const datePrefix = now.slice(0, 10);
+    const timePrefix = now.slice(11, 16).replace(':', '');
+    const filename = `${datePrefix}_${acc.workspace}_${timePrefix}_auto`;
+    const jsonPath = join(config.sessions_dir, `${filename}.json`);
+    const mdPath = join(config.sessions_dir, `${filename}.md`);
+
+    const state: SessionState = {
+      id: currentSessionId || randomUUID(),
+      workspace: acc.workspace,
+      timestamp: now,
+      phase: acc.phase,
+      completed_operations: acc.completed_operations.map(op => ({
+        timestamp: now,
+        description: op.description,
+        result: op.result as Operation['result'] || 'success',
+      })),
+      active_files: acc.active_files,
+      decisions_made: acc.decisions_made,
+      next_steps: acc.next_steps,
+      git_state: { branch: 'unknown', uncommitted: false },
+      warnings: [...acc.warnings, '[AUTO-ESCALATED] Session save triggered by checkpoint threshold'],
+      metadata: { auto_escalated: true, checkpoint_count: acc.checkpoint_count },
+    };
+
+    writeFileSync(jsonPath, JSON.stringify(state, null, 2), 'utf-8');
+    writeFileSync(mdPath, generateHandoffMarkdown(state), 'utf-8');
+
+    acc.last_escalation = now;
+    acc.checkpoint_count = 0;
+
+    return { handoff_path: mdPath, json_path: jsonPath };
+  }
 
   return {
     continuity_save_session: async (input: Record<string, unknown>) => {
@@ -155,6 +231,9 @@ export function createSessionHandlers(db: ContinuityDatabase, config: Continuity
       });
 
       currentSessionId = null;
+
+      // Clear accumulator on clean save
+      accumulators.delete(workspace);
 
       return {
         success: true,
@@ -228,15 +307,43 @@ export function createSessionHandlers(db: ContinuityDatabase, config: Continuity
       const workspace = input.workspace as string;
       const now = new Date().toISOString();
 
+      // Update accumulator with new checkpoint data
+      const acc = getOrCreateAccumulator(workspace);
+      acc.checkpoint_count++;
+
+      // Merge incoming data into accumulator (latest wins for scalars, append for arrays)
+      if (input.phase) acc.phase = input.phase as string;
+      if (input.active_files) acc.active_files = input.active_files as string[];
+      if (input.next_steps) acc.next_steps = input.next_steps as string[];
+      if (input.warnings) acc.warnings = [...acc.warnings, ...(input.warnings as string[])];
+
+      // Append new decisions (deduplicated)
+      const newDecisions = (input.decisions as string[]) || [];
+      for (const d of newDecisions) {
+        if (!acc.decisions_made.includes(d)) acc.decisions_made.push(d);
+      }
+
+      // Append completed operation from this checkpoint
+      const opDescription = input.operation as string;
+      acc.completed_operations.push({ description: opDescription, result: 'success' });
+
+      // Build enriched checkpoint state (carries full accumulated context)
       const cp: Checkpoint = {
         id: randomUUID(),
         workspace,
         timestamp: now,
-        operation: input.operation as string,
+        operation: opDescription,
         state: {
-          active_files: (input.active_files as string[]) || [],
-          next_steps: (input.next_steps as string[]) || [],
-          decisions_made: (input.decisions as string[]) || [],
+          phase: acc.phase,
+          active_files: acc.active_files,
+          next_steps: acc.next_steps,
+          decisions_made: acc.decisions_made,
+          warnings: acc.warnings,
+          completed_operations: acc.completed_operations.map(op => ({
+            timestamp: now,
+            description: op.description,
+            result: op.result as Operation['result'],
+          })),
         },
         trigger: (input.trigger as Checkpoint['trigger']) || 'manual',
       };
@@ -250,12 +357,38 @@ export function createSessionHandlers(db: ContinuityDatabase, config: Continuity
       // Prune old checkpoints (keep last 50 per workspace)
       db.pruneCheckpoints(workspace, 50);
 
+      // Auto-escalation: if checkpoint count exceeds threshold, write full handoff
+      let escalated = false;
+      let escalation_result: { handoff_path: string; json_path: string } | null = null;
+      if (acc.checkpoint_count >= config.auto_escalation_threshold) {
+        escalation_result = escalateToFullSave(acc);
+        escalated = true;
+
+        // Also update session record with handoff path
+        if (currentSessionId) {
+          db.endSession(currentSessionId, now, acc.completed_operations.length, true, escalation_result.handoff_path);
+          // Reopen as new session (session continues, just snapshotted)
+          currentSessionId = randomUUID();
+          db.createSession({
+            id: currentSessionId,
+            workspace,
+            start_time: now,
+            operations_count: 0,
+            ended_cleanly: false,
+          });
+        }
+      }
+
       return {
         success: true,
         checkpoint_id: cp.id,
         workspace,
         operation: cp.operation,
         timestamp: now,
+        checkpoint_number: acc.checkpoint_count,
+        escalation_threshold: config.auto_escalation_threshold,
+        auto_escalated: escalated,
+        ...(escalation_result ? { handoff_path: escalation_result.handoff_path } : {}),
       };
     },
 

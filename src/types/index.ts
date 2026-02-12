@@ -120,6 +120,7 @@ export interface ContinuityConfig {
   decisions_dir: string;
   db_path: string;
   auto_checkpoint_interval: number;
+  auto_escalation_threshold: number;
   compression_target_tokens: number;
   handoff_quality_threshold: number;
 }
